@@ -17,7 +17,7 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
-from adam_atan2 import AdamATan2
+from adam_atan2_pytorch import AdamAtan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
@@ -147,9 +147,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     # Optimizers and lr
     if config.arch.puzzle_emb_ndim == 0:
         optimizers = [
-            AdamATan2(
+            AdamAtan2(
                 model.parameters(),
-                lr=0,  # Needs to be set by scheduler
+                lr=config.lr,  # Needs to be set by scheduler
                 weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
@@ -161,7 +161,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         optimizers = [
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.model.puzzle_emb.buffers(),  # type: ignore
-                lr=0,  # Needs to be set by scheduler
+                lr=config.puzzle_emb_lr,  # Needs to be set by scheduler
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=world_size
             )
@@ -173,13 +173,13 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         optimizers = [
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.model.puzzle_emb.buffers(),  # type: ignore
-                lr=0,  # Needs to be set by scheduler
+                lr=config.puzzle_emb_lr,  # Needs to be set by scheduler
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=world_size
             ),
-            AdamATan2(
+            AdamAtan2(
                 model.parameters(),
-                lr=0,  # Needs to be set by scheduler
+                lr=config.lr,  # Needs to be set by scheduler
                 weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
@@ -608,6 +608,11 @@ def launch(hydra_config: DictConfig):
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
+                if config.checkpoint_path is not None:
+                    import json
+                    os.makedirs(config.checkpoint_path, exist_ok=True)
+                    with open(os.path.join(config.checkpoint_path, "metrics.jsonl"), "a") as f:
+                        f.write(json.dumps({"step": train_state.step, **{k: float(v) for k, v in metrics.items()}}) + "\n")
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
@@ -634,6 +639,12 @@ def launch(hydra_config: DictConfig):
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
+                if config.checkpoint_path is not None:
+                    import json
+                    os.makedirs(config.checkpoint_path, exist_ok=True)
+                    with open(os.path.join(config.checkpoint_path, "metrics.jsonl"), "a") as f:
+                        flat = {k: float(v) for k, v in metrics.items() if not isinstance(v, dict)}
+                        f.write(json.dumps({"step": train_state.step, "eval": True, **flat}) + "\n")
                 
             ############ Checkpointing
             if RANK == 0:
