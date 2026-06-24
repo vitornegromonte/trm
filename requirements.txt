@@ -1,5 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cu118
 torch
-adam-atan2
+adam-atan2-pytorch
 einops
 tqdm
 coolname
