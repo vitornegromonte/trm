@@ -48,6 +48,7 @@ class ProfileConfig:
     memory: bool = False
     kernel: bool = False
     no_compile: bool = True
+    epochs_per_iter: int = 100  # how many dataset epochs to generate batches for
     output_dir: str = "profiles"
     # overrides forwarded to Hydra
     overrides: list = field(default_factory=list)
@@ -65,17 +66,19 @@ class ProfileConfig:
 # ---------------------------------------------------------------------------
 
 def make_synthetic_dataset(save_dir: str, cfg: ProfileConfig):
-    """Create a minimal 2-group synthetic dataset as .npy files."""
+    """Create a synthetic dataset as .npy files. Size auto-scales to support --batches."""
     import numpy as np
     split_dir = os.path.join(save_dir, "train")
     os.makedirs(split_dir, exist_ok=True)
 
     seq_len = cfg.seq_len
     vocab_size = cfg.vocab_size
-    num_puzzles = cfg.num_puzzle_ids
+    # Scale dataset to support the requested batch count
+    target_examples = (cfg.warmup + cfg.batches) * max(cfg.epochs_per_iter, 1) * 128
     examples_per_puzzle = 4
+    groups = max(16, target_examples // 256)
+    num_puzzles = max(cfg.num_puzzle_ids, target_examples // examples_per_puzzle + 1)
     total = num_puzzles * examples_per_puzzle
-    groups = 2
 
     inputs = np.random.randint(0, vocab_size, (total, seq_len)).astype(np.int32)
     labels = np.random.randint(0, vocab_size, (total, seq_len)).astype(np.int32)
@@ -305,7 +308,7 @@ class PipelineProfiler:
         self._log(f"Loading datasets from {config.data_paths} ...")
         train_loader, train_metadata = create_dataloader(
             config, "train", test_set_mode=False,
-            epochs_per_iter=1,
+            epochs_per_iter=self.cfg.epochs_per_iter,
             global_batch_size=config.global_batch_size,
             rank=rank, world_size=world_size,
         )
@@ -442,7 +445,7 @@ def run_torch_profiler(cfg: ProfileConfig):
 
     train_loader, train_metadata = create_dataloader(
         config, "train", test_set_mode=False,
-        epochs_per_iter=1,
+        epochs_per_iter=cfg.epochs_per_iter,
         global_batch_size=config.global_batch_size,
         rank=rank, world_size=world_size,
     )
@@ -523,6 +526,7 @@ def parse_args():
     p.add_argument("--kernel", action="store_true", help="GPU kernel-level profiling (implies --trace)")
     p.add_argument("--memory", action="store_true", help="Profile CUDA memory")
     p.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    p.add_argument("--epochs", type=int, default=100, help="Dataset epochs per iter (increase if not enough data)")
     p.add_argument("--synthetic", action="store_true", help="Use synthetic data (no real dataset needed)")
     p.add_argument("--output-dir", default="profiles", help="Output directory for traces")
     p.add_argument("overrides", nargs="*", help="Hydra config overrides")
@@ -539,6 +543,7 @@ if __name__ == "__main__":
         memory=args.memory,
         kernel=args.kernel,
         no_compile=not args.compile,
+        epochs_per_iter=args.epochs,
         output_dir=args.output_dir,
         overrides=args.overrides,
         synthetic=args.synthetic,
