@@ -31,10 +31,9 @@ import torch.distributed as dist
 os.environ["DISABLE_COMPILE"] = "1"  # skip compile for profiling to avoid startup noise
 
 from pretrain import (
-    PretrainConfig, init_train_state, create_dataloader, train_batch,
+    PretrainConfig, init_train_state, create_dataloader,
     compute_lr, cosine_schedule_with_warmup_lr_lambda,
 )
-from puzzle_dataset import PuzzleDatasetConfig
 
 
 # ---------------------------------------------------------------------------
@@ -194,11 +193,14 @@ class PipelineProfiler:
 
     def _gather_batch_timings(self, batch_gen, train_state, config):
         """Run warmup + profiling batches, recording per-stage timings."""
-        step = 0
-        for set_name, batch, global_batch_size in batch_gen:
+        for step, (set_name, batch, global_batch_size) in enumerate(batch_gen):
             if step >= self.cfg.warmup + self.cfg.batches:
                 break
             is_profiling = step >= self.cfg.warmup
+
+            if not is_profiling:
+                warmup_batches = min(self.cfg.warmup, self.cfg.batches + self.cfg.warmup)
+                self._log(f"  warmup batch {step + 1}/{warmup_batches}")
 
             batch = {k: v.cuda() for k, v in batch.items()}
 
@@ -229,9 +231,9 @@ class PipelineProfiler:
             train_state.step += 1
             self._log(f"  profile batch {step - self.cfg.warmup + 1}/{self.cfg.batches}")
 
-            # 1. dataloading (already done above via iteration, measure the batch-to-cuda)
-            with measure("dataloader", self.timings):
-                d = {k: v.cuda() for k, v in batch.items()}
+            # 1. H2D transfer (measure actual dataloading: CPU→GPU copy)
+            with measure("dataloader", self.timings, sync=True):
+                batch = {k: v.cuda() for k, v in batch.items()}
 
             # 2. forward
             with measure("forward", self.timings, sync=True):
@@ -340,7 +342,15 @@ class PipelineProfiler:
         print("=" * 72)
 
         all_stages = ["dataloader", "forward", "backward", "allreduce", "optimizer"]
-        present = [s for s in all_stages if s in self.timings]
+        present = [s for s in all_stages if s in self.timings and len(self.timings[s]) > 0]
+
+        if not present:
+            print("\nNo profiling data collected.")
+            print("Possible causes:")
+            print("  - Not enough data: dataset produced fewer batches than warmup + profiling")
+            print("  - OOM during warmup: increase --warmup, decrease global_batch_size")
+            print("  - Try: global_batch_size=32 --batches 10")
+            return
 
         # Per-stage summary
         print(f"\n{'Stage':<16} {'Median(ms)':<12} {'Mean(ms)':<12} {'Min(ms)':<12} {'Max(ms)':<12} {'P99(ms)':<12}")
@@ -360,19 +370,22 @@ class PipelineProfiler:
                 median_total += med
 
         if totals:
-            total_med = sum(sorted(totals)[len(totals) // 2] for _ in [1])
             print("-" * 76)
             print(f"{'Compute total':<16} {median_total:<12.3f}")
 
         # Step time estimate
         step_median = median_total
-        if "dataloader" in self.timings:
-            dl_med = sorted(self.timings["dataloader"])[len(self.timings["dataloader"]) // 2]
+        dl_med = 0.0
+        if "dataloader" in self.timings and len(self.timings["dataloader"]) > 0:
+            dl_ts = sorted(self.timings["dataloader"])
+            dl_med = dl_ts[len(dl_ts) // 2]
             print(f"{'Data loader':<16} {dl_med:<12.3f}")
             print(f"{'Step total':<16} {step_median + dl_med:<12.3f}")
 
-        print(f"\nEstimated throughput: {1000 / (step_median + (dl_med if 'dataloader' in self.timings else 0)):.1f} steps/s")
-        print(f"Estimated step time:  {step_median + (dl_med if 'dataloader' in self.timings else 0):.1f} ms")
+        total_step = step_median + dl_med
+        if total_step > 0:
+            print(f"\nEstimated throughput: {1000 / total_step:.1f} steps/s")
+            print(f"Estimated step time:  {total_step:.1f} ms")
         print(f"Estimated memory:     peak={torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
         # Bottleneck
@@ -386,26 +399,12 @@ class PipelineProfiler:
                 pct = med / step_median * 100
                 label = "⚠️  " if pct > 30 else "   "
                 print(f"  {label}{stage:<14} {med:<8.3f} ms  ({pct:.0f}%)")
-            if "dataloader" in self.timings:
-                dl_ts = sorted(self.timings["dataloader"])
-                dl_med = dl_ts[len(dl_ts) // 2]
-                dl_pct = dl_med / (step_median + dl_med) * 100
+            if dl_med > 0:
+                dl_pct = dl_med / total_step * 100
                 label = "⚠️  " if dl_pct > 20 else "   "
                 print(f"  {label}dataloader     {dl_med:<8.3f} ms  ({dl_pct:.0f}% of total step)")
 
-        # Model-level analysis
-        self._model_stats()
 
-    def _model_stats(self):
-        """Compute model-level metrics from the recorded timings."""
-        print(f"\n--- Model-level metrics ---")
-        total_params = sum(p.numel() for p in torch.cuda.current_stream().device.__class__.__module__ or False)
-        # simpler version:
-        from pretrain import PretrainConfig as _  # noqa
-
-    def save_trace(self, trace_path: str):
-        """Save Chrome trace. Called externally when --trace is set."""
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -475,8 +474,7 @@ def run_torch_profiler(cfg: ProfileConfig):
     )
 
     prof.start()
-    step = 0
-    for set_name, batch, global_batch_size in train_loader:
+    for step, (set_name, batch, global_batch_size) in enumerate(train_loader):
         if step >= cfg.warmup + 2 + 5:
             break
         batch = {k: v.cuda() for k, v in batch.items()}
@@ -503,7 +501,6 @@ def run_torch_profiler(cfg: ProfileConfig):
 
         train_state.step += 1
         prof.step()
-        step += 1
 
     prof.stop()
 
