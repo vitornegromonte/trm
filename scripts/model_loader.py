@@ -449,7 +449,8 @@ class OriginalTRMAdapter(nn.Module):
 
         max_steps = max_steps or getattr(self.act_model.config, "halt_max_steps", 16)
 
-        carry = self.act_model.initial_carry(batch)
+        with torch.device(device):
+            carry = self.act_model.initial_carry(batch)
         outputs = None
         for _ in range(max_steps):
             carry, outputs = self.act_model(carry, batch)
